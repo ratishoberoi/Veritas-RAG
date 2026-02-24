@@ -247,32 +247,30 @@ flowchart TD
 Stateless LLMs have no concept of "previous turn." Neural KB implements **session-scoped conversational memory** using LangChain's `RunnableWithMessageHistory` — a wrapper that automatically hydrates and persists conversation state around any LCEL chain.
 
 ```mermaid
-stateDiagram-v2
-    [*] --> NewSession: First query
+flowchart TD
+    START(["🔵 User Query"]) --> CHECK{session_id\nin store?}
 
-    state NewSession {
-        [*] --> CreateHistory: session_id not in store{}
-        CreateHistory --> StoreHistory: ChatMessageHistory()
-    }
+    CHECK -->|"No — first query"| CREATE["Create ChatMessageHistory()\nstore[session_id] = history"]
+    CHECK -->|"Yes — returning user"| LOAD["Load existing history"]
 
-    state ExistingSession {
-        [*] --> LoadHistory: session_id found in store{}
-        LoadHistory --> TrimHistory: len > 20 messages?
-        TrimHistory --> InjectHistory: messages[-20:]
-    }
+    LOAD --> TRIM{"len > 20\nmessages?"}
+    TRIM -->|"Yes"| EVICT["Evict oldest\nkeep last 20"]
+    TRIM -->|"No"| INJECT
+    EVICT --> INJECT
 
-    NewSession --> Invoke: history injected into prompt
-    ExistingSession --> Invoke: history injected into prompt
+    CREATE --> INJECT["Inject history into prompt\nSystemPrompt + ChatHistory + HumanMessage"]
 
-    state Invoke {
-        [*] --> BuildPrompt: [SystemPrompt + ChatHistory + HumanMessage]
-        BuildPrompt --> LLMCall
-        LLMCall --> ParseResponse
-    }
+    INJECT --> LLM["Groq LLM Call"]
+    LLM --> SAVE["Auto-save to history\nHumanMessage + AIMessage"]
 
-    Invoke --> SaveTurn: Auto-save HumanMessage + AIMessage
-    SaveTurn --> ExistingSession: Next query
-    SaveTurn --> [*]: Session cleared
+    SAVE --> NEXT{Another\nquery?}
+    NEXT -->|"Yes"| CHECK
+    NEXT -->|"Clear button"| RESET["store[session_id] = ChatMessageHistory()"]
+    RESET --> START
+
+    style START fill:#7c6fff,color:#fff
+    style RESET fill:#ff5f7e,color:#fff
+    style LLM fill:#4dffa6,color:#000
 ```
 
 ### Anaphora Resolution in Practice
