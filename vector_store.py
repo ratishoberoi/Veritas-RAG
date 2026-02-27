@@ -1,13 +1,15 @@
 import os
 import time
-from typing import List, Optional
+from typing import List, Optional, Any
 from dotenv import load_dotenv
 from langchain_core.documents import Document
+from langchain_core.retrievers import BaseRetriever
+from langchain_core.callbacks.manager import CallbackManagerForRetrieverRun
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_pinecone import PineconeVectorStore
 from langchain_community.retrievers import BM25Retriever
-from langchain_community.retrievers import BM25Retriever, EnsembleRetriever
 from pinecone import Pinecone, ServerlessSpec
+from pydantic import Field
 
 load_dotenv()
 
@@ -61,12 +63,10 @@ def init_pinecone_index():
 
 
 def upload_documents(chunks: List[Document], namespace: Optional[str] = None) -> PineconeVectorStore:
-    """Upload document chunks to Pinecone vector store."""
     if not chunks:
         raise ValueError("[VectorStore] ❌ No chunks to upload.")
 
     print(f"[VectorStore] 🔄 Uploading {len(chunks)} chunks to Pinecone...")
-
     try:
         init_pinecone_index()
         embeddings = get_embeddings()
@@ -78,7 +78,6 @@ def upload_documents(chunks: List[Document], namespace: Optional[str] = None) ->
             namespace=namespace
         )
         vector_store.add_documents(chunks, batch_size=100)
-
         print(f"[VectorStore] ✅ Successfully uploaded {len(chunks)} chunks.")
         return vector_store
 
@@ -87,12 +86,10 @@ def upload_documents(chunks: List[Document], namespace: Optional[str] = None) ->
 
 
 def load_vector_store(namespace: Optional[str] = None) -> PineconeVectorStore:
-    """Load existing Pinecone vector store for retrieval."""
     print("[VectorStore] 🔄 Loading existing Pinecone vector store...")
     try:
         embeddings = get_embeddings()
         index_name = os.getenv("PINECONE_INDEX_NAME", "rag-knowledge-base")
-
         vector_store = PineconeVectorStore(
             index_name=index_name,
             embedding=embeddings,
@@ -105,69 +102,162 @@ def load_vector_store(namespace: Optional[str] = None) -> PineconeVectorStore:
         raise ConnectionError(f"[VectorStore] ❌ Failed to load vector store: {str(e)}")
 
 
+# ─────────────────────────────────────────────
+# CUSTOM HYBRID RETRIEVER (no EnsembleRetriever needed)
+# ─────────────────────────────────────────────
+
+class HybridRetriever(BaseRetriever):
+    """
+    Custom Hybrid Retriever implementing Reciprocal Rank Fusion (RRF)
+    over BM25 (sparse) + Pinecone dense vector search.
+
+    No dependency on langchain.retrievers.EnsembleRetriever.
+
+    RRF Formula:
+        score(d) = Σ  weight_i / (rank_i(d) + 60)
+
+    The constant 60 is a smoothing factor that prevents top-ranked
+    documents from dominating. Documents appearing in BOTH result
+    lists receive additive scores — consensus between retrieval
+    methods naturally floats the best chunks to the top.
+    """
+
+    dense_retriever: Any = Field(description="Pinecone vector store retriever")
+    sparse_retriever: Any = Field(description="BM25 in-memory retriever")
+    dense_weight: float = Field(default=0.6)
+    sparse_weight: float = Field(default=0.4)
+    k: int = Field(default=12)
+    rrf_k: int = Field(default=60, description="RRF smoothing constant")
+
+    class Config:
+        arbitrary_types_allowed = True
+
+    def _get_relevant_documents(
+        self,
+        query: str,
+        *,
+        run_manager: CallbackManagerForRetrieverRun = None
+    ) -> List[Document]:
+        """
+        Fetch from both retrievers, fuse with weighted RRF, return top-k.
+
+        Steps:
+          1. Run dense retrieval → ordered list of docs
+          2. Run BM25 retrieval → ordered list of docs
+          3. For each doc in each list, compute: weight / (rank + rrf_k)
+          4. Sum scores for docs appearing in both lists
+          5. Sort by final RRF score descending → return top k
+        """
+        # ── Fetch from both retrievers ──
+        try:
+            dense_docs = self.dense_retriever.invoke(query)
+        except Exception as e:
+            print(f"[HybridRetriever] ⚠️ Dense retrieval failed: {e}")
+            dense_docs = []
+
+        try:
+            sparse_docs = self.sparse_retriever.invoke(query)
+        except Exception as e:
+            print(f"[HybridRetriever] ⚠️ BM25 retrieval failed: {e}")
+            sparse_docs = []
+
+        # ── Build RRF score map keyed by page_content ──
+        scores: dict = {}      # content_hash → score
+        doc_map: dict = {}     # content_hash → Document
+
+        def content_key(doc: Document) -> str:
+            return doc.page_content[:200]  # use first 200 chars as stable key
+
+        # Score dense results
+        for rank, doc in enumerate(dense_docs):
+            key = content_key(doc)
+            rrf_score = self.dense_weight / (rank + self.rrf_k)
+            scores[key] = scores.get(key, 0.0) + rrf_score
+            if key not in doc_map:
+                doc_map[key] = doc
+
+        # Score BM25 results
+        for rank, doc in enumerate(sparse_docs):
+            key = content_key(doc)
+            rrf_score = self.sparse_weight / (rank + self.rrf_k)
+            scores[key] = scores.get(key, 0.0) + rrf_score
+            if key not in doc_map:
+                doc_map[key] = doc
+
+        # ── Sort by RRF score descending ──
+        sorted_keys = sorted(scores.keys(), key=lambda k: scores[k], reverse=True)
+
+        result = []
+        for key in sorted_keys[:self.k]:
+            doc = doc_map[key]
+            doc.metadata["rrf_score"] = round(scores[key], 6)
+            result.append(doc)
+
+        print(f"[HybridRetriever] ✅ RRF fusion: "
+              f"{len(dense_docs)} dense + {len(sparse_docs)} BM25 → top {len(result)}")
+        return result
+
+
 def build_bm25_retriever(
     chunks: List[Document],
-    k: int = 4
+    k: int = 12
 ) -> BM25Retriever:
-    """
-    Build an in-memory BM25 retriever from document chunks.
-
-    BM25 (Best Match 25) is a probabilistic keyword ranking algorithm.
-    It excels at exact term matching — technical IDs, specific parameter
-    names, numeric values — that dense embeddings often miss.
-
-    Args:
-        chunks: List of Document objects (same chunks uploaded to Pinecone)
-        k: Number of documents to retrieve per query
-
-    Returns:
-        BM25Retriever instance ready for use in EnsembleRetriever
-    """
     if not chunks:
         raise ValueError("[VectorStore] ❌ Cannot build BM25 retriever: no chunks provided.")
-
     print(f"[VectorStore] 🔄 Building BM25 index over {len(chunks)} chunks...")
     retriever = BM25Retriever.from_documents(chunks, k=k)
     print(f"[VectorStore] ✅ BM25 index ready ({len(chunks)} documents).")
     return retriever
 
 
+def _apply_metadata_filter(
+    chunks: List[Document],
+    filter_dict: dict
+) -> List[Document]:
+    """
+    Manually apply metadata filter to BM25 chunks (in-memory equivalent
+    of Pinecone's server-side filter). Supports substring matching.
+    """
+    filtered = []
+    for doc in chunks:
+        match = True
+        for key, value in filter_dict.items():
+            doc_val = str(doc.metadata.get(key, "")).lower()
+            filter_val = str(value).lower()
+            if filter_val not in doc_val:
+                match = False
+                break
+        if match:
+            filtered.append(doc)
+    return filtered
+
+
 def build_hybrid_retriever(
     chunks: List[Document],
     namespace: Optional[str] = None,
     source_filter: Optional[dict] = None,
-    k: int = 4,
+    k: int = 12,
     bm25_weight: float = 0.4,
     vector_weight: float = 0.6
-) -> EnsembleRetriever:
+) -> HybridRetriever:
     """
-    Build a Hybrid Retriever combining BM25 + Pinecone vector search
-    via Reciprocal Rank Fusion (RRF).
-
-    RRF score formula:
-        RRF(d) = Σ 1 / (rank_i(d) + k)
-    where rank_i(d) is the rank of document d in retriever i,
-    and k=60 is a smoothing constant (LangChain default).
-
-    Weights:
-        - vector_weight=0.6 → semantic understanding dominates
-        - bm25_weight=0.4  → keyword precision supplements
+    Build a HybridRetriever combining BM25 + Pinecone via custom RRF.
 
     Args:
-        chunks: Document chunks (required for BM25 in-memory index)
-        namespace: Pinecone namespace for isolation
-        source_filter: Metadata filter dict for Pinecone (e.g. {"method": "groq_whisper"})
-        k: Number of results per retriever (final output = merged RRF ranking)
-        bm25_weight: Weight for BM25 results in RRF fusion
-        vector_weight: Weight for vector search results in RRF fusion
+        chunks: Document chunks for BM25 in-memory index
+        namespace: Pinecone namespace
+        source_filter: Metadata filter for scoped retrieval
+        k: Total candidates to return after fusion
+        bm25_weight: BM25 contribution to RRF (default 0.4)
+        vector_weight: Dense vector contribution to RRF (default 0.6)
 
     Returns:
-        EnsembleRetriever combining both retrievers
+        HybridRetriever instance (LangChain BaseRetriever compatible)
     """
     print("[VectorStore] 🔄 Building Hybrid Retriever (BM25 + Pinecone)...")
     print(f"[VectorStore] ⚖️  Weights → Vector: {vector_weight} | BM25: {bm25_weight}")
 
-    # ── Dense vector retriever (Pinecone) ──
+    # ── Dense retriever (Pinecone) ──
     vector_store = load_vector_store(namespace=namespace)
     search_kwargs = {"k": k}
     if source_filter:
@@ -179,98 +269,25 @@ def build_hybrid_retriever(
         search_kwargs=search_kwargs
     )
 
-    # ── Sparse keyword retriever (BM25) ──
-    # Apply source filter manually to BM25 since it's in-memory
+    # ── Sparse retriever (BM25) with manual filter ──
     filtered_chunks = chunks
     if source_filter and chunks:
         filtered_chunks = _apply_metadata_filter(chunks, source_filter)
         print(f"[VectorStore] 🔍 BM25 filtered to {len(filtered_chunks)} chunks")
 
     if not filtered_chunks:
-        print("[VectorStore] ⚠️  No chunks match filter for BM25 — using dense only.")
+        print("[VectorStore] ⚠️ No BM25 chunks match filter — using dense only.")
         return dense_retriever
 
     sparse_retriever = build_bm25_retriever(filtered_chunks, k=k)
 
-    # ── Ensemble with RRF fusion ──
-    hybrid_retriever = EnsembleRetriever(
-        retrievers=[dense_retriever, sparse_retriever],
-        weights=[vector_weight, bm25_weight]
+    hybrid = HybridRetriever(
+        dense_retriever=dense_retriever,
+        sparse_retriever=sparse_retriever,
+        dense_weight=vector_weight,
+        sparse_weight=bm25_weight,
+        k=k
     )
 
-    print("[VectorStore] ✅ Hybrid retriever ready (RRF fusion active).")
-    return hybrid_retriever
-
-
-def _apply_metadata_filter(
-    chunks: List[Document],
-    filter_dict: dict
-) -> List[Document]:
-    """
-    Apply metadata filtering to BM25 chunks manually.
-    Mimics Pinecone's server-side metadata filtering for BM25 in-memory store.
-
-    Supports:
-        - Exact match: {"method": "groq_whisper"}
-        - Substring match: {"source": "pdf"} matches any source containing "pdf"
-    """
-    filtered = []
-    for doc in chunks:
-        match = True
-        for key, value in filter_dict.items():
-            doc_val = str(doc.metadata.get(key, "")).lower()
-            filter_val = str(value).lower()
-            # Substring match for flexibility (e.g. "pdf" matches ".pdf" paths)
-            if filter_val not in doc_val:
-                match = False
-                break
-        if match:
-            filtered.append(doc)
-    return filtered
-
-
-if __name__ == "__main__":
-    from ingestor import ingest
-
-    print("\n" + "="*50)
-    print("FULL SYNC: PDF + YouTube → Pinecone + BM25 Test")
-    print("="*50)
-
-    all_chunks = []
-
-    print("\n--- INGESTING: PDF ---")
-    try:
-        pdf_path = "data/transformer_paper.pdf"
-        if not os.path.exists(pdf_path):
-            print(f"[Sync] ⚠️ PDF not found at {pdf_path} — skipping.")
-        else:
-            pdf_chunks = ingest(source=pdf_path, source_type="pdf")
-            print(f"[Sync] ✅ PDF → {len(pdf_chunks)} chunks.")
-            all_chunks.extend(pdf_chunks)
-    except Exception as e:
-        print(f"[Sync] ❌ PDF ingestion failed: {e}")
-
-    print(f"\n--- COMBINED: {len(all_chunks)} total chunks ---")
-
-    if all_chunks:
-        vector_store = upload_documents(all_chunks)
-
-        print("\n--- HYBRID RETRIEVER TEST ---")
-        hybrid = build_hybrid_retriever(chunks=all_chunks, k=4)
-
-        test_queries = [
-            "What is the BLEU score of the base model?",  # numeric — BM25 advantage
-            "How does multi-head attention work?",          # semantic — vector advantage
-            "β1 β2 epsilon optimizer hyperparameters",    # technical terms — BM25 advantage
-        ]
-
-        for query in test_queries:
-            print(f"\n🔍 Hybrid Query: '{query}'")
-            results = hybrid.invoke(query)
-            for i, doc in enumerate(results[:2]):
-                source = doc.metadata.get("source", "unknown")
-                print(f"  Result {i+1}: {doc.page_content[:100]}...")
-
-    print("\n" + "="*50)
-    print("✅ Hybrid retriever test complete.")
-    print("="*50)
+    print("[VectorStore] ✅ HybridRetriever ready (custom RRF fusion).")
+    return hybrid
