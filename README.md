@@ -1,4 +1,4 @@
-# 🧠 Neural KB — Production-Grade Personal Knowledge Engine
+# 🧠 Veritas-RAG — Production-Grade Personal Knowledge Engine
 
 <div align="center">
 
