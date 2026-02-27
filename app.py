@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 import tempfile
 from ingestor import ingest
 from vector_store import upload_documents
-from retriever import ask, build_rag_chain, store
+from retriever import ask, build_rag_chain, store, register_chunks  # ← CHANGE 1: added register_chunks
 
 load_dotenv()
 
@@ -169,12 +169,12 @@ def eval_card_html(evaluation: dict) -> str:
 
     hallucination_row = ""
     if hallucination and reason:
-        # Sanitize reason to prevent HTML injection/truncation
         safe_reason = str(reason)[:200].replace('<', '&lt;').replace('>', '&gt;')
         hallucination_row = f"""
         <div style="margin-top:6px;padding:6px 8px;background:#ff5f7e08;
                     border-left:2px solid #ff5f7e;border-radius:0 4px 4px 0;
                     font-size:0.72rem;color:#ff5f7e;">⚡ {safe_reason}</div>"""
+
     return f"""
     <div style="background:#16161f;border:1px solid {accent}22;border-radius:10px;
                 padding:12px 14px;margin:8px 0;border-left:3px solid {accent};">
@@ -247,7 +247,7 @@ def load_chain(source_filter=None):
 
 
 # ─────────────────────────────────────────────
-# SIDEBAR — only ingestion + filters + stats
+# SIDEBAR — ingestion + filters + stats
 # ─────────────────────────────────────────────
 
 def render_sidebar():
@@ -317,6 +317,7 @@ def render_sidebar():
                             source_type=source_type.lower()
                         )
                         upload_documents(chunks)
+                        register_chunks(chunks)  # ← CHANGE 2: feed BM25 corpus after upload
                         label = (
                             uploaded_file.name
                             if source_type == "PDF" and uploaded_file
@@ -325,7 +326,7 @@ def render_sidebar():
                         short_label = label[:35] + "..." if len(label) > 35 else label
                         st.session_state.ingested_sources.append(f"{source_type}: {short_label}")
                         load_chain(st.session_state.active_filter)
-                        st.success(f"✅ {len(chunks)} chunks uploaded!")
+                        st.success(f"✅ {len(chunks)} chunks uploaded! (Hybrid search active)")
                     except Exception as e:
                         st.error(f"❌ {e}")
 
@@ -479,6 +480,14 @@ def render_chat():
             if message["role"] == "assistant":
                 if message.get("evaluation"):
                     st.markdown(eval_card_html(message["evaluation"]), unsafe_allow_html=True)
+                if message.get("retrieval_mode"):
+                    mode = message["retrieval_mode"]
+                    mode_color = "#7c6fff" if "Hybrid" in mode else "#4dffa6"
+                    st.markdown(
+                        f'<div style="font-family:JetBrains Mono,monospace;font-size:0.68rem;'
+                        f'color:{mode_color};margin:4px 0 8px 0;">{mode}</div>',
+                        unsafe_allow_html=True
+                    )
                 if message.get("sources"):
                     with st.expander("📚 Sources Used"):
                         chips = "".join([source_chip_html(s) for s in message["sources"]])
@@ -502,9 +511,18 @@ def render_chat():
                     answer = result["answer"]
                     evaluation = result["evaluation"]
                     sources = result["sources"]
+                    retrieval_mode = result.get("retrieval_mode", "🔷 Dense Vector")  # ← CHANGE 3a
 
                     st.session_state.turn_count += 1
                     st.markdown(answer)
+
+                    # ← CHANGE 3b: retrieval mode badge below answer
+                    mode_color = "#7c6fff" if "Hybrid" in retrieval_mode else "#4dffa6"
+                    st.markdown(
+                        f'<div style="font-family:JetBrains Mono,monospace;font-size:0.68rem;'
+                        f'color:{mode_color};margin:4px 0 8px 0;">{retrieval_mode}</div>',
+                        unsafe_allow_html=True
+                    )
 
                     if evaluation:
                         st.markdown(eval_card_html(evaluation), unsafe_allow_html=True)
@@ -518,7 +536,8 @@ def render_chat():
                         "role": "assistant",
                         "content": answer,
                         "evaluation": evaluation,
-                        "sources": sources
+                        "sources": sources,
+                        "retrieval_mode": retrieval_mode  # ← persisted for chat history render
                     })
 
                 except Exception as e:
@@ -530,7 +549,8 @@ def render_chat():
                         "role": "assistant",
                         "content": err,
                         "evaluation": None,
-                        "sources": []
+                        "sources": [],
+                        "retrieval_mode": None
                     })
 
 

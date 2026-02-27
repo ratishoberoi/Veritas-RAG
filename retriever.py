@@ -1,16 +1,18 @@
 import os
 import json
 import re
-from typing import Optional
+from typing import Optional, List
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnablePassthrough
+from langchain_core.runnables import RunnablePassthrough, RunnableLambda
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_community.chat_message_histories import ChatMessageHistory
-from langchain_core.messages import HumanMessage, AIMessage
-from vector_store import load_vector_store
+from langchain_core.messages import HumanMessage
+from langchain_core.documents import Document
+from vector_store import load_vector_store, build_hybrid_retriever
+from reranker import rerank_documents, rerank_with_explanation
 
 load_dotenv()
 
@@ -62,17 +64,32 @@ ANSWER: {answer}
 Return ONLY the JSON object. No explanation, no markdown, no code blocks."""
 
 store = {}
+_session_chunks: List[Document] = []
+
+
+def register_chunks(chunks: List[Document]):
+    """Register ingested chunks into BM25 corpus cache."""
+    global _session_chunks
+    _session_chunks.extend(chunks)
+    seen = set()
+    deduped = []
+    for doc in _session_chunks:
+        if doc.page_content not in seen:
+            seen.add(doc.page_content)
+            deduped.append(doc)
+    _session_chunks = deduped
+    print(f"[Retriever] 📚 BM25 corpus: {len(_session_chunks)} unique chunks registered.")
+
+
+def get_session_chunks() -> List[Document]:
+    return _session_chunks
 
 
 def get_llm(model: str = "llama-3.1-8b-instant") -> ChatGroq:
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
         raise ValueError("[Retriever] ❌ GROQ_API_KEY not found in .env")
-    return ChatGroq(
-        api_key=api_key,
-        model_name=model,
-        temperature=0,
-    )
+    return ChatGroq(api_key=api_key, model_name=model, temperature=0)
 
 
 def format_docs(docs: list) -> str:
@@ -82,18 +99,20 @@ def format_docs(docs: list) -> str:
         method = doc.metadata.get("method", "unknown")
         page = doc.metadata.get("page", "")
         title = doc.metadata.get("title", "")
+        rerank_score = doc.metadata.get("rerank_score", None)
 
         source_label = f"Source {i+1}"
-        if "youtube" in source or method == "groq_whisper":
+        if "youtube" in str(source).lower() or method == "groq_whisper":
             source_label += f" [YouTube: {title}]"
-        elif source.endswith(".pdf"):
-            source_label += f" [PDF: {os.path.basename(source)}"
+        elif str(source).endswith(".pdf"):
+            source_label += f" [PDF: {os.path.basename(str(source))}"
             if page != "":
-                source_label += f", Page {int(page)+1}"
+                source_label += f", Page {int(float(page))+1}"
             source_label += "]"
+        if rerank_score is not None:
+            source_label += f" (relevance: {rerank_score:.2f})"
 
         formatted.append(f"{source_label}:\n{doc.page_content}")
-
     return "\n\n---\n\n".join(formatted)
 
 
@@ -106,27 +125,14 @@ def get_session_history(session_id: str) -> ChatMessageHistory:
     return history
 
 
-def evaluate_response(
-    question: str,
-    context: str,
-    answer: str
-) -> dict:
+def evaluate_response(question: str, context: str, answer: str) -> dict:
     try:
         llm = get_llm()
         eval_prompt = ChatPromptTemplate.from_template(EVALUATOR_PROMPT)
         eval_chain = eval_prompt | llm | StrOutputParser()
-
-        raw = eval_chain.invoke({
-            "question": question,
-            "context": context,
-            "answer": answer
-        })
-
-        raw = raw.strip()
-        raw = re.sub(r"```json|```", "", raw).strip()
-
+        raw = eval_chain.invoke({"question": question, "context": context, "answer": answer})
+        raw = re.sub(r"```json|```", "", raw.strip()).strip()
         result = json.loads(raw)
-
         return {
             "context_sufficient": bool(result.get("context_sufficient", False)),
             "confidence_score": int(result.get("confidence_score", 0)),
@@ -134,35 +140,118 @@ def evaluate_response(
             "hallucination_reason": result.get("hallucination_reason", ""),
             "evaluation_summary": result.get("evaluation_summary", "")
         }
-
     except Exception as e:
         print(f"[Evaluator] ⚠️ Evaluation failed: {e}")
         return {
-            "context_sufficient": False,
-            "confidence_score": 0,
-            "hallucination_detected": False,
-            "hallucination_reason": "",
+            "context_sufficient": False, "confidence_score": 0,
+            "hallucination_detected": False, "hallucination_reason": "",
             "evaluation_summary": "Evaluation unavailable."
         }
 
 
-def build_rag_chain(
+def _build_dense_retriever(
     namespace: Optional[str] = None,
-    source_filter: Optional[dict] = None
+    source_filter: Optional[dict] = None,
+    k: int = 12
 ):
-    print("[Retriever] 🔄 Building RAG chain with memory...")
-
     vector_store = load_vector_store(namespace=namespace)
-
-    search_kwargs = {"k": 4}
+    search_kwargs = {"k": k}
     if source_filter:
         search_kwargs["filter"] = source_filter
-        print(f"[Retriever] 🔍 Source filter applied: {source_filter}")
+        print(f"[Retriever] 🔍 Source filter: {source_filter}")
+    return vector_store.as_retriever(search_type="similarity", search_kwargs=search_kwargs)
 
-    retriever = vector_store.as_retriever(
-        search_type="similarity",
-        search_kwargs=search_kwargs
+
+def retrieve_and_rerank(
+    query: str,
+    retriever,
+    use_reranking: bool = True,
+    retrieval_k: int = 12,
+    final_k: int = 4,
+    reranker_model: str = "BAAI/bge-reranker-base",
+    score_threshold: Optional[float] = None
+) -> List[Document]:
+    """
+    Two-stage retrieval:
+
+    Stage 1 — Broad Recall:
+        Fetch `retrieval_k` candidates (default 12) via hybrid/dense.
+        High recall ensures the correct chunk is always a candidate.
+
+    Stage 2 — Precision Filter (Cross-Encoder):
+        Cross-encoder sees (query, chunk) as a single input — unlike
+        bi-encoders which embed independently. This joint scoring
+        captures exact term overlap, co-references, and contextual
+        relevance that cosine similarity misses.
+
+        Result: top `final_k` (4) high-precision chunks for LLM.
+
+    Noise reduction example:
+        Query: "What is β₂ for Adam optimizer?"
+        Without rerank: chunks about "beta testing" may rank high
+                        (similar embeddings to "beta" concept)
+        With rerank:    cross-encoder scores joint relevance,
+                        "beta testing" drops to score ~-4, optimizer
+                        chunk rises to score ~7 → clean context
+    """
+    candidates = retriever.invoke(query)
+
+    if not use_reranking or len(candidates) <= final_k:
+        return candidates[:final_k]
+
+    print(f"[Retriever] 🎯 Reranking {len(candidates)} → top {final_k}...")
+    return rerank_documents(
+        query=query,
+        docs=candidates,
+        top_k=final_k,
+        model_name=reranker_model,
+        score_threshold=score_threshold,
+        return_scores=True
     )
+
+
+def build_rag_chain(
+    namespace: Optional[str] = None,
+    source_filter: Optional[dict] = None,
+    use_hybrid: bool = True,
+    use_reranking: bool = True,
+    retrieval_k: int = 12,
+    final_k: int = 4,
+    bm25_weight: float = 0.4,
+    vector_weight: float = 0.6,
+    reranker_model: str = "BAAI/bge-reranker-base"
+):
+    """
+    3-stage RAG pipeline:
+        1. Hybrid Retrieval (BM25 + Pinecone, RRF fusion) → 12 candidates
+        2. Cross-Encoder Reranking (bge-reranker-base) → top 4
+        3. LLM Generation (Groq/Llama 3) with conversation memory
+    """
+    chunks = get_session_chunks()
+
+    if use_hybrid and chunks:
+        try:
+            base_retriever = build_hybrid_retriever(
+                chunks=chunks,
+                namespace=namespace,
+                source_filter=source_filter,
+                k=retrieval_k,
+                bm25_weight=bm25_weight,
+                vector_weight=vector_weight
+            )
+            retriever_label = "hybrid"
+        except Exception as e:
+            print(f"[Retriever] ⚠️ Hybrid failed ({e}), using dense.")
+            base_retriever = _build_dense_retriever(namespace, source_filter, k=retrieval_k)
+            retriever_label = "dense"
+    else:
+        if use_hybrid and not chunks:
+            print("[Retriever] ⚠️ No BM25 corpus — dense-only retrieval.")
+        base_retriever = _build_dense_retriever(namespace, source_filter, k=retrieval_k)
+        retriever_label = "dense"
+
+    rerank_label = f"+rerank({reranker_model.split('/')[-1]})" if use_reranking else ""
+    print(f"[Retriever] 🔍 Pipeline: {retriever_label}{rerank_label} → top{final_k}")
 
     llm = get_llm()
 
@@ -177,9 +266,20 @@ def build_rag_chain(
             return x.get("question", "")
         return str(x)
 
+    def retrieval_pipeline(x):
+        q = extract_question(x)
+        return retrieve_and_rerank(
+            query=q,
+            retriever=base_retriever,
+            use_reranking=use_reranking,
+            retrieval_k=retrieval_k,
+            final_k=final_k,
+            reranker_model=reranker_model
+        )
+
     core_chain = (
         {
-            "context": (lambda x: extract_question(x)) | retriever | format_docs,
+            "context": RunnableLambda(retrieval_pipeline) | format_docs,
             "question": RunnablePassthrough() | (lambda x: extract_question(x)),
             "chat_history": lambda x: x.get("chat_history", []) if isinstance(x, dict) else []
         }
@@ -195,47 +295,48 @@ def build_rag_chain(
         history_messages_key="chat_history"
     )
 
-    print("[Retriever] ✅ RAG chain with memory ready.")
-    return chain_with_history, retriever
+    print("[Retriever] ✅ RAG chain ready.")
+    return chain_with_history, base_retriever
 
 
 def ask(
     question: str,
     session_id: str = "default",
     namespace: Optional[str] = None,
-    source_filter: Optional[dict] = None
+    source_filter: Optional[dict] = None,
+    use_hybrid: bool = True,
+    use_reranking: bool = True
 ) -> dict:
-    chain, retriever = build_rag_chain(
+    chain, base_retriever = build_rag_chain(
         namespace=namespace,
-        source_filter=source_filter
+        source_filter=source_filter,
+        use_hybrid=use_hybrid,
+        use_reranking=use_reranking
     )
 
-    search_kwargs = {"k": 4}
-    if source_filter:
-        search_kwargs["filter"] = source_filter
-
-    source_docs = retriever.invoke(question)
-    context_str = format_docs(source_docs)
+    final_docs = retrieve_and_rerank(
+        query=question,
+        retriever=base_retriever,
+        use_reranking=use_reranking,
+        retrieval_k=12,
+        final_k=4
+    )
+    context_str = format_docs(final_docs)
 
     answer = chain.invoke(
         {"question": question},
         config={"configurable": {"session_id": session_id}}
     )
 
-    evaluation = evaluate_response(
-        question=question,
-        context=context_str,
-        answer=answer
-    )
+    evaluation = evaluate_response(question=question, context=context_str, answer=answer)
 
     seen = set()
     sources_used = []
-    for doc in source_docs:
+    for doc in final_docs:
         source = doc.metadata.get("source", "unknown")
         method = doc.metadata.get("method", "unknown")
         title = doc.metadata.get("title", "")
         page = doc.metadata.get("page", "")
-
         if source not in seen:
             seen.add(source)
             if method == "groq_whisper" or "youtube" in str(source).lower():
@@ -244,11 +345,18 @@ def ask(
                 page_info = f", Page {int(float(page))+1}" if page != "" else ""
                 sources_used.append(f"📄 PDF: {os.path.basename(str(source))}{page_info}")
 
+    chunks = get_session_chunks()
+    parts = ["🔀 Hybrid" if chunks else "🔷 Dense"]
+    if use_reranking:
+        parts.append("+ 🎯 Reranked")
+    retrieval_mode = " ".join(parts)
+
     return {
         "answer": answer,
         "sources": sources_used,
         "evaluation": evaluation,
-        "session_id": session_id
+        "session_id": session_id,
+        "retrieval_mode": retrieval_mode
     }
 
 
@@ -260,64 +368,57 @@ def render_evaluation(evaluation: dict):
     reason = evaluation["hallucination_reason"]
 
     if score >= 70 and sufficient and not hallucination:
-        status = "✅ Context Verified"
-        bar_color = "🟢"
+        status, bar_color = "✅ Context Verified", "🟢"
     elif score >= 40:
-        status = "⚠️  Moderate Confidence"
-        bar_color = "🟡"
+        status, bar_color = "⚠️  Moderate Confidence", "🟡"
     else:
-        status = "🔴 Low Confidence"
-        bar_color = "🔴"
+        status, bar_color = "🔴 Low Confidence", "🔴"
 
-    filled = int(score / 10)
-    bar = bar_color * filled + "⬜" * (10 - filled)
-
+    bar = bar_color * int(score / 10) + "⬜" * (10 - int(score / 10))
     print(f"\n📊 Evaluation:")
     print(f"   Status     : {status}")
     print(f"   Confidence : {bar} {score}%")
     print(f"   Summary    : {summary}")
-
     if hallucination:
         print(f"   ⚠️  Hallucination Flag: {reason}")
-
     if not sufficient:
-        print(f"   ℹ️  Context was insufficient for a complete answer.")
+        print(f"   ℹ️  Context insufficient for a complete answer.")
 
 
 if __name__ == "__main__":
-    print("\n" + "="*50)
-    print("🧠 Personal Knowledge Base — Terminal Chat")
-    print("   (Memory + Filters + Self-Evaluation)")
-    print("="*50)
-    print("Commands:")
-    print("  'exit'         → Quit")
-    print("  'clear'        → Clear chat history")
-    print("  'filter pdf'   → Search only PDFs")
-    print("  'filter yt'    → Search only YouTube")
-    print("  'filter off'   → Remove filter")
-    print("  'history'      → Show chat history")
-    print("-"*50 + "\n")
+    print("\n" + "="*60)
+    print("🧠 Neural KB — Terminal Chat")
+    print("   Hybrid Search + Cross-Encoder Reranking")
+    print("="*60)
+    print("Commands: exit | clear | filter pdf | filter yt | filter off")
+    print("          history | mode | debug <query>")
+    print("-"*60 + "\n")
 
     SESSION_ID = "terminal_session"
     active_filter = None
 
-    print("[Retriever] 🔄 Initializing (this may take a few seconds)...")
+    try:
+        from ingestor import ingest as _ingest
+        _pdf = "data/transformer_paper.pdf"
+        if os.path.exists(_pdf):
+            print(f"[Retriever] 📄 Pre-loading BM25 corpus from {_pdf}...")
+            _chunks = _ingest(source=_pdf, source_type="pdf")
+            register_chunks(_chunks)
+    except Exception as _e:
+        print(f"[Retriever] ⚠️ BM25 pre-load skipped: {_e}")
+
+    print("[Retriever] 🔄 Initializing (reranker loads on first query)...")
     try:
         chain, retriever = build_rag_chain(source_filter=active_filter)
     except Exception as e:
-        print(f"[Retriever] ❌ Failed to initialize: {e}")
+        print(f"[Retriever] ❌ Failed: {e}")
         exit(1)
-
     print("[Retriever] ✅ Ready!\n")
 
     while True:
         try:
-            filter_label = ""
-            if active_filter:
-                filter_label = f" [{list(active_filter.values())[0]}]"
-
+            filter_label = f" [{list(active_filter.values())[0]}]" if active_filter else ""
             question = input(f"You{filter_label}: ").strip()
-
             if not question:
                 continue
 
@@ -328,25 +429,43 @@ if __name__ == "__main__":
             if question.lower() == "clear":
                 if SESSION_ID in store:
                     store[SESSION_ID] = ChatMessageHistory()
-                print("🗑️  Chat history cleared.\n")
+                print("🗑️  Cleared.\n")
+                continue
+
+            if question.lower() == "mode":
+                c = get_session_chunks()
+                print(f"\n🔍 {('🔀 Hybrid BM25+Dense' if c else '🔷 Dense')} → 🎯 Rerank → top 4 → Llama 3")
+                print(f"   BM25 corpus: {len(c)} chunks\n")
+                continue
+
+            if question.lower().startswith("debug "):
+                dq = question[6:].strip()
+                cands = retriever.invoke(dq)
+                _, report = rerank_with_explanation(dq, cands, top_k=4)
+                print(f"\n{'Rank':<5} {'Score':<8} {'Keep':<6} {'Source':<35} Preview")
+                print("-"*90)
+                for r in report:
+                    print(f"{r['rank']:<5} {r['score']:<8.3f} {'✅' if r['kept'] else '❌':<6} "
+                          f"{r['source']:<35} {r['preview']}")
+                print()
                 continue
 
             if question.lower() == "filter pdf":
                 active_filter = {"source": "pdf"}
                 chain, retriever = build_rag_chain(source_filter=active_filter)
-                print("🔍 Filter set: PDFs only.\n")
+                print("🔍 PDF only.\n")
                 continue
 
             if question.lower() == "filter yt":
                 active_filter = {"method": "groq_whisper"}
                 chain, retriever = build_rag_chain(source_filter=active_filter)
-                print("🔍 Filter set: YouTube only.\n")
+                print("🔍 YouTube only.\n")
                 continue
 
             if question.lower() == "filter off":
                 active_filter = None
                 chain, retriever = build_rag_chain(source_filter=None)
-                print("🔍 Filter removed — searching all sources.\n")
+                print("🔍 Filter removed.\n")
                 continue
 
             if question.lower() == "history":
@@ -356,15 +475,17 @@ if __name__ == "__main__":
                 else:
                     print("\n📜 Chat History:")
                     for msg in history.messages:
-                        role = "You" if isinstance(msg, HumanMessage) else "🤖"
-                        print(f"  {role}: {msg.content[:120]}...")
+                        print(f"  {'You' if isinstance(msg, HumanMessage) else '🤖'}: {msg.content[:120]}...")
                     print()
                 continue
 
             print("\n🤔 Thinking...\n")
 
-            source_docs = retriever.invoke(question)
-            context_str = format_docs(source_docs)
+            final_docs = retrieve_and_rerank(
+                query=question, retriever=retriever,
+                use_reranking=True, retrieval_k=12, final_k=4
+            )
+            context_str = format_docs(final_docs)
 
             answer = chain.invoke(
                 {"question": question},
@@ -375,28 +496,30 @@ if __name__ == "__main__":
 
             history = get_session_history(SESSION_ID)
             turn_count = len([m for m in history.messages if isinstance(m, HumanMessage)])
-            print(f"\n💬 Memory: {turn_count} turn(s) in session")
+            c = get_session_chunks()
+            print(f"\n💬 Memory: {turn_count} | {'🔀 Hybrid + 🎯 Reranked' if c else '🔷 Dense + 🎯 Reranked'}")
 
             seen = set()
-            print("📚 Sources:")
-            for doc in source_docs:
-                source = doc.metadata.get("source", "unknown")
-                method = doc.metadata.get("method", "unknown")
+            print("📚 Sources (reranked):")
+            for doc in final_docs:
+                src = doc.metadata.get("source", "unknown")
+                method = doc.metadata.get("method", "")
                 title = doc.metadata.get("title", "")
                 page = doc.metadata.get("page", "")
-                if source not in seen:
-                    seen.add(source)
+                score = doc.metadata.get("rerank_score")
+                score_str = f" [score:{score:.2f}]" if score is not None else ""
+                if src not in seen:
+                    seen.add(src)
                     if method == "groq_whisper":
-                        print(f"  🎥 YouTube: {title}")
+                        print(f"  🎥 {title}{score_str}")
                     else:
-                        page_info = f", Page {int(page)+1}" if page != "" else ""
-                        print(f"  📄 PDF: {os.path.basename(source)}{page_info}")
+                        pg = f", p{int(float(page))+1}" if page != "" else ""
+                        print(f"  📄 {os.path.basename(str(src))}{pg}{score_str}")
 
-            print("\n⏳ Evaluating response...")
+            print("\n⏳ Evaluating...")
             evaluation = evaluate_response(question, context_str, answer)
             render_evaluation(evaluation)
-
-            print("\n" + "-"*50 + "\n")
+            print("\n" + "-"*60 + "\n")
 
         except KeyboardInterrupt:
             print("\n\n👋 Goodbye!")
